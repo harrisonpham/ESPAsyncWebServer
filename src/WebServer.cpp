@@ -21,6 +21,18 @@
 #include "ESPAsyncWebServer.h"
 #include "WebHandlerImpl.h"
 
+#ifndef ESP_ASYNC_WEBSERVER_FREE_HEAP_LEVEL_CRITICAL
+#define ESP_ASYNC_WEBSERVER_FREE_HEAP_LEVEL_CRITICAL (8 * 1024)
+#endif
+
+#ifndef ESP_ASYNC_WEBSERVER_FREE_HEAP_LEVEL_WARN
+#define ESP_ASYNC_WEBSERVER_FREE_HEAP_LEVEL_WARN (16 * 1024)
+#endif
+
+#ifndef ESP_ASYNC_WEBSERVER_MAX_ACTIVE_REQUESTS
+#define ESP_ASYNC_WEBSERVER_MAX_ACTIVE_REQUESTS 10
+#endif
+
 bool ON_STA_FILTER(AsyncWebServerRequest *request) {
   return WiFi.localIP() == request->client()->localIP();
 }
@@ -34,6 +46,7 @@ AsyncWebServer::AsyncWebServer(uint16_t port)
   : _server(port)
   , _rewrites(LinkedList<AsyncWebRewrite*>(nullptr))
   , _handlers(LinkedList<AsyncWebHandler*>(nullptr))
+  , _active_requests(0)
 {
   _catchAllHandler = new AsyncCallbackWebHandler();
   if(_catchAllHandler == NULL)
@@ -41,20 +54,49 @@ AsyncWebServer::AsyncWebServer(uint16_t port)
   _server.onClient([](void *s, AsyncClient* c){
     if(c == NULL)
       return;
-    c->setRxTimeout(3);
-    AsyncWebServerRequest *r = new AsyncWebServerRequest((AsyncWebServer*)s, c);
-    if(r == NULL){
-      c->close(true);
-      c->free();
-      delete c;
+
+    AsyncWebServer* server = (AsyncWebServer*)s;
+
+    // Based on https://github.com/me-no-dev/ESPAsyncWebServer/pull/1116
+    int free_heap = ESP.getFreeHeap();
+    if (free_heap < ESP_ASYNC_WEBSERVER_FREE_HEAP_LEVEL_CRITICAL) {
+      server->_freeClient(c);
+      return;
     }
+
+    c->setRxTimeout(3);
+    AsyncWebServerRequest *r = new AsyncWebServerRequest(server, c);
+    if(r == NULL){
+      server->_freeClient(c);
+      return;
+    }
+
+    if (free_heap < ESP_ASYNC_WEBSERVER_FREE_HEAP_LEVEL_WARN) {
+      r->send(503);
+      return;
+    }
+
+    if (server->getActiveRequests() > ESP_ASYNC_WEBSERVER_MAX_ACTIVE_REQUESTS) {
+      AsyncWebServerResponse* response = r->beginResponse(429);
+      if (!response) {
+        server->_freeClient(c);
+        return;
+      }
+      response->addHeader("Retry-After", "1");
+      r->send(response);
+    }
+
   }, this);
 }
 
 AsyncWebServer::~AsyncWebServer(){
-  reset();  
+  reset();
   end();
   if(_catchAllHandler) delete _catchAllHandler;
+}
+
+int32_t AsyncWebServer::getActiveRequests() {
+  return _active_requests;
 }
 
 AsyncWebRewrite& AsyncWebServer::addRewrite(AsyncWebRewrite* rewrite){
@@ -118,7 +160,7 @@ void AsyncWebServer::_attachHandler(AsyncWebServerRequest *request){
       return;
     }
   }
-  
+
   request->addInterestingHeader("ANY");
   request->setHandler(_catchAllHandler);
 }
@@ -183,7 +225,7 @@ void AsyncWebServer::onRequestBody(ArBodyHandlerFunction fn){
 void AsyncWebServer::reset(){
   _rewrites.free();
   _handlers.free();
-  
+
   if (_catchAllHandler != NULL){
     _catchAllHandler->onRequest(NULL);
     _catchAllHandler->onUpload(NULL);
@@ -191,3 +233,8 @@ void AsyncWebServer::reset(){
   }
 }
 
+void AsyncWebServer::_freeClient(AsyncClient* c) {
+  c->close(true);
+  c->free();
+  delete c;
+}
